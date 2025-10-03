@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""
+AGI Python Master - Multi-Language Terminal Interface with Auto-Fix
+===================================================================
+5-Agent Pipeline: CodeGen → Review → Venv → Install → Run
+Auto-Error Detection: Monitors Mac terminal for errors, triggers fix agent
+Manual Update: Available anytime for feature additions
+Two Models: Primary (generation) + Secondary (auto-fix)
+Enhanced GitHub: Auto-push on every change
+"""
+
+import os
+import re
+import ast
+import json
+import time
+import venv
+import shutil
+import subprocess
+import threading
+from pathlib import Path
+from typing import List, Tuple, Set, Optional
+from urllib.parse import quote as urlquote
+
+import requests
+import streamlit as st
+from requests.adapters import HTTPAdapter, Retry
+
+st.set_page_config(page_title="AGI Python Master", page_icon="🧠", layout="wide")
+
+if "app" not in st.session_state:
+    st.session_state.app = {
+        "started": False, "phase": "idle", "project_dir": str(Path.cwd() / "agi_project"),
+        "primary_model": "", "fix_model": "", "available_models": [], "base_url": "http://localhost:11434",
+        "timeout": 120, "max_tokens": 3000, "gen_output": [], "mac_output": [], "generated_code": "",
+        "python_exec": "", "error_detected": False, "auto_fix_running": False, "fix_attempts": 0,
+        "max_fix_attempts": 3, "show_editor": False, "editor_content": "", "git_connected": False,
+        "git_token": "", "git_username": "", "git_repo_name": "", "git_repo_url": "",
+        "git_repo_created": False, "settings_expanded": False, "auto_push_enabled": True,
+        "logs": [], "show_logs": False, "log_level": "DEBUG",
+    }
+
+app = st.session_state.app
+
+st.markdown("""
+<style>
+.main { background-color: #0d1117; color: #c9d1d9; }
+.stApp { background-color: #0d1117; }
+.phase-bar { display: flex; gap: 8px; margin: 20px 0; padding: 10px; background: #161b22; border-radius: 6px; }
+.phase-pill { padding: 6px 14px; border-radius: 16px; font-size: 13px; font-weight: 500; border: 1px solid #30363d; background: #0d1117; }
+.phase-active { background: #f0883e; color: #000; border-color: #f0883e; }
+.phase-done { background: #238636; color: #fff; border-color: #238636; }
+.phase-pending { color: #8b949e; }
+.phase-fixing { background: #da3633; color: #fff; border-color: #da3633; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+.terminal-header { background: #161b22; padding: 8px 12px; border-radius: 6px 6px 0 0; font-weight: 600; font-size: 14px; border: 1px solid #30363d; border-bottom: none; display: flex; justify-content: space-between; align-items: center; }
+.terminal-gen { color: #58a6ff; }
+.terminal-mac { color: #3fb950; }
+.terminal-body { background: #0d1117; border: 1px solid #30363d; border-radius: 0 0 6px 6px; padding: 12px; font-family: 'SF Mono', Monaco, monospace; font-size: 13px; line-height: 1.5; height: 400px; overflow-y: auto; color: #c9d1d9; white-space: pre-wrap; }
+.git-status { padding: 10px; border-radius: 6px; margin: 10px 0; font-size: 13px; }
+.git-connected { background: #0d4429; border: 1px solid #238636; color: #3fb950; }
+.git-disconnected { background: #2d1f1f; border: 1px solid #da3633; color: #ff7b72; }
+.error-badge { background: #da3633; color: #fff; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.fix-badge { background: #f0883e; color: #000; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; animation: pulse 1.5s infinite; }
+</style>
+""", unsafe_allow_html=True)
+
+def log_gen(msg: str):
+    """Log to generation terminal - only code, no timestamps"""
+    app["gen_output"].append(msg)
+
+def log_mac(msg: str):
+    app["mac_output"].append(msg)
+
+def clear_terminals():
+    app["gen_output"].clear()
+    app["mac_output"].clear()
+
+def log_system(level: str, component: str, message: str, data: dict = None):
+    """Advanced logging system - tracks everything with millisecond precision"""
+    timestamp = time.strftime('%H:%M:%S') + f".{int((time.time() % 1) * 1000):03d}"
+    log_entry = {
+        "timestamp": timestamp,
+        "level": level,
+        "component": component,
+        "message": message,
+        "data": data or {}
+    }
+    app["logs"].append(log_entry)
+    if len(app["logs"]) > 1000:
+        app["logs"] = app["logs"][-1000:]
+
+def format_log_entry(entry: dict) -> str:
+    """Format log entry for display"""
+    level_colors = {
+        "DEBUG": "🔍",
+        "INFO": "ℹ️",
+        "WARNING": "⚠️",
+        "ERROR": "❌",
+        "LATENCY": "⏱️",
+        "FREEZE": "🧊"
+    }
+    icon = level_colors.get(entry["level"], "•")
+    msg = f"[{entry['timestamp']}] {icon} [{entry['component']}] {entry['message']}"
+    if entry["data"]:
+        msg += f" | {json.dumps(entry['data'], indent=None)}"
+    return msg
+
+def detect_error_in_output(output_lines: List[str]) -> bool:
+    error_patterns = [r'Traceback \(most recent call last\)', r'Error:', r'Exception:', r'AttributeError:', r'TypeError:', r'ValueError:', r'ImportError:', r'ModuleNotFoundError:', r'SyntaxError:', r'IndentationError:', r'KeyError:', r'IndexError:', r'ZeroDivisionError:', r'FileNotFoundError:']
+    recent_output = '\n'.join(output_lines[-20:])
+    for pattern in error_patterns:
+        if re.search(pattern, recent_output, re.IGNORECASE):
+            return True
+    return False
+
+def extract_error_context(output_lines: List[str]) -> str:
+    return '\n'.join(output_lines[-30:])
+
+class Ollama:
+    def __init__(self, model: str, base_url: str, timeout: int):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        retry = Retry(total=2, backoff_factor=0.5)
+        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+        log_system("INFO", "Ollama", f"Initialized Ollama client", {"model": model, "base_url": base_url})
+
+    def available(self) -> bool:
+        log_system("DEBUG", "Ollama", "Checking Ollama availability", {"url": f"{self.base_url}/api/tags"})
+        start_time = time.time()
+        try:
+            r = self.session.get(f"{self.base_url}/api/tags", timeout=5)
+            elapsed = (time.time() - start_time) * 1000
+            log_system("LATENCY", "Ollama", f"Availability check completed", {"latency_ms": f"{elapsed:.2f}", "status": r.status_code})
+            return r.status_code == 200
+        except Exception as e:
+            elapsed = (time.time() - start_time) * 1000
+            log_system("ERROR", "Ollama", f"Availability check failed", {"latency_ms": f"{elapsed:.2f}", "error": str(e)[:100]})
+            return False
+
+    def get_models(self) -> List[str]:
+        log_system("DEBUG", "Ollama", "Fetching available models")
+        start_time = time.time()
+        try:
+            r = self.session.get(f"{self.base_url}/api/tags", timeout=5)
+            elapsed = (time.time() - start_time) * 1000
+            if r.status_code == 200:
+                data = r.json()
+                models = [m['name'] for m in data.get('models', [])]
+                log_system("INFO", "Ollama", f"Models retrieved", {"count": len(models), "latency_ms": f"{elapsed:.2f}", "models": models})
+                return models
+            else:
+                log_system("WARNING", "Ollama", f"Failed to get models", {"status": r.status_code, "latency_ms": f"{elapsed:.2f}"})
+        except Exception as e:
+            elapsed = (time.time() - start_time) * 1000
+            log_system("ERROR", "Ollama", f"Error fetching models", {"latency_ms": f"{elapsed:.2f}", "error": str(e)[:100]})
+        return []
+
+    def generate(self, prompt: str, temp: float = 0.6, silent: bool = False) -> str:
+        log_system("INFO", "Ollama", f"Starting generation", {"model": self.model, "temp": temp, "prompt_length": len(prompt), "max_tokens": app["max_tokens"]})
+        payload = {"model": self.model, "prompt": prompt, "stream": True, "options": {"temperature": temp, "num_predict": app["max_tokens"]}}
+        log_system("DEBUG", "Ollama", "Sending request payload", {"payload_size": len(json.dumps(payload))})
+        
+        full_response = []
+        request_start = time.time()
+        last_chunk_time = request_start
+        freeze_threshold = 5.0
+        
+        try:
+            r = self.session.post(f"{self.base_url}/api/generate", json=payload, timeout=(10, self.timeout), stream=True)
+            r.raise_for_status()
+            
+            connection_time = (time.time() - request_start) * 1000
+            log_system("LATENCY", "Ollama", f"Connection established", {"latency_ms": f"{connection_time:.2f}"})
+            
+            buffer = ""
+            chunk_count = 0
+            total_chars = 0
+            
+            for line in r.iter_lines(decode_unicode=True):
+                current_time = time.time()
+                time_since_last = (current_time - last_chunk_time) * 1000
+                
+                if time_since_last > freeze_threshold * 1000:
+                    log_system("FREEZE", "Ollama", f"Detected freeze - no data for {time_since_last/1000:.2f}s", {"chunk_count": chunk_count})
+                
+                if not line:
+                    continue
+                
+                try:
+                    data = json.loads(line)
+                    chunk_count += 1
+                    
+                    if "response" in data:
+                        chunk = data["response"]
+                        chunk_size = len(chunk)
+                        total_chars += chunk_size
+                        full_response.append(chunk)
+                        
+                        if chunk_count % 10 == 0:
+                            log_system("DEBUG", "Ollama", f"Streaming chunk", {"chunk": chunk_count, "chars": total_chars, "latency_ms": f"{time_since_last:.2f}"})
+                        
+                        if time_since_last > 1000:
+                            log_system("LATENCY", "Ollama", f"Slow chunk detected", {"chunk": chunk_count, "latency_ms": f"{time_since_last:.2f}"})
+                        
+                        if not silent:
+                            buffer += chunk
+                            if len(buffer) > 20 or '\n' in buffer:
+                                while '\n' in buffer:
+                                    line_out, buffer = buffer.split('\n', 1)
+                                    log_gen(line_out)
+                                if len(buffer) > 50:
+                                    log_gen(buffer)
+                                    buffer = ""
+                    
+                    if data.get("done"):
+                        total_time = (time.time() - request_start) * 1000
+                        log_system("INFO", "Ollama", f"Generation completed", {
+                            "total_time_ms": f"{total_time:.2f}",
+                            "chunks": chunk_count,
+                            "total_chars": total_chars,
+                            "chars_per_sec": f"{(total_chars / (total_time/1000)):.2f}" if total_time > 0 else "N/A"
+                        })
+                        if buffer and not silent:
+                            log_gen(buffer)
+                        break
+                    
+                    last_chunk_time = current_time
+                    
+                except json.JSONDecodeError as e:
+                    log_system("WARNING", "Ollama", f"JSON decode error", {"error": str(e), "line": line[:100]})
+                    continue
+            
+        except requests.exceptions.Timeout:
+            elapsed = (time.time() - request_start) * 1000
+            log_system("ERROR", "Ollama", f"Request timeout", {"elapsed_ms": f"{elapsed:.2f}", "timeout": self.timeout})
+            raise
+        except Exception as e:
+            elapsed = (time.time() - request_start) * 1000
+            log_system("ERROR", "Ollama", f"Generation error", {"elapsed_ms": f"{elapsed:.2f}", "error": str(e)[:200]})
+            raise
+        
+        return "".join(full_response)
+
+def extract_code(text: str) -> str:
+    match = re.search(r'```python\s+(.*?)```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r'```\s+(.*?)```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+def extract_imports(code: str) -> List[str]:
+    imports = set()
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.add(alias.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split('.')[0])
+    except:
+        for match in re.findall(r'^\s*(?:from\s+([\w.]+)|import\s+([\w.]+))', code, re.M):
+            imports.add((match[0] or match[1]).split('.')[0])
+    return sorted(imports)
+
+def map_to_pip(imports: List[str]) -> List[str]:
+    mapping = {'cv2': 'opencv-python', 'PIL': 'Pillow', 'sklearn': 'scikit-learn', 'yaml': 'PyYAML', 'bs4': 'beautifulsoup4', 'dotenv': 'python-dotenv', 'fastapi': 'fastapi', 'flask': 'flask', 'pygame': 'pygame', 'requests': 'requests', 'pandas': 'pandas', 'numpy': 'numpy'}
+    stdlib = {'os', 'sys', 'json', 're', 'time', 'datetime', 'math', 'random', 'collections', 'pathlib', 'subprocess', 'threading', 'typing', 'enum', 'dataclasses', 'asyncio', 'venv', 'shutil', 'tempfile'}
+    packages = []
+    for imp in imports:
+        if imp not in stdlib:
+            packages.append(mapping.get(imp, imp))
+    return sorted(set(packages))
+
+def connect_git() -> bool:
+    try:
+        subprocess.run(['git', '--version'], capture_output=True, timeout=5, check=True)
+        if not app["git_token"]:
+            log_gen("❌ No GitHub token provided")
+            return False
+        headers = {"Authorization": f"token {app['git_token']}"}
+        r = requests.get("https://api.github.com/user", headers=headers, timeout=10)
+        if r.status_code == 200:
+            user_data = r.json()
+            app["git_username"] = user_data.get("login", "")
+            app["git_connected"] = True
+            log_gen(f"✅ GitHub connected as: {app['git_username']}")
+            return True
+        else:
+            app["git_connected"] = False
+            log_gen(f"❌ Invalid GitHub token (status: {r.status_code})")
+            return False
+    except subprocess.CalledProcessError:
+        app["git_connected"] = False
+        log_gen("❌ Git not installed on system")
+        return False
+    except Exception as e:
+        app["git_connected"] = False
+        log_gen(f"❌ GitHub connection failed: {str(e)[:100]}")
+        return False
+
+def create_github_repo() -> bool:
+    if not app["git_connected"] or not app["git_repo_name"]:
+        log_gen("❌ Cannot create repo: Not connected or no repo name")
+        return False
+    try:
+        headers = {"Authorization": f"token {app['git_token']}", "Accept": "application/vnd.github.v3+json"}
+        payload = {"name": app["git_repo_name"], "private": False, "auto_init": False, "description": "Created by AGI Python Master"}
+        log_gen("")
+        log_gen("═" * 60)
+        log_gen(f"📦 Creating GitHub repository: {app['git_repo_name']}")
+        r = requests.post("https://api.github.com/user/repos", headers=headers, json=payload, timeout=30)
+        if r.status_code == 201:
+            repo_data = r.json()
+            app["git_repo_url"] = repo_data["clone_url"]
+            app["git_repo_created"] = True
+            log_gen(f"✅ Repository created successfully")
+            log_gen(f"URL: {app['git_repo_url']}")
+            log_gen("═" * 60)
+            return True
+        elif r.status_code == 422:
+            app["git_repo_url"] = f"https://github.com/{app['git_username']}/{app['git_repo_name']}.git"
+            app["git_repo_created"] = True
+            log_gen(f"✅ Repository already exists, using it")
+            log_gen(f"URL: {app['git_repo_url']}")
+            log_gen("═" * 60)
+            return True
+        else:
+            error_msg = r.json().get('message', 'Unknown error')
+            log_gen(f"❌ Failed to create repo: {error_msg}")
+            log_gen("═" * 60)
+            return False
+    except Exception as e:
+        log_gen(f"❌ Repo creation error: {str(e)[:100]}")
+        log_gen("═" * 60)
+        return False
+
+def git_push_code(commit_message: str = None) -> bool:
+    if not app["git_repo_created"] or not app["auto_push_enabled"]:
+        return False
+    proj_dir = Path(app["project_dir"])
+    def run_git(args: List[str]) -> Tuple[int, str]:
+        try:
+            result = subprocess.run(['git'] + args, cwd=str(proj_dir), capture_output=True, text=True, timeout=60)
+            return result.returncode, result.stderr or result.stdout
+        except Exception as e:
+            return 1, str(e)
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen("📤 Auto-pushing to GitHub...")
+    code, _ = run_git(['rev-parse', '--git-dir'])
+    if code != 0:
+        run_git(['init'])
+        run_git(['checkout', '-b', 'main'])
+        log_gen("• Initialized git repository")
+    run_git(['config', 'user.email', 'agi@pythonmaster.dev'])
+    run_git(['config', 'user.name', 'AGI Python Master'])
+    gitignore = proj_dir / '.gitignore'
+    if not gitignore.exists():
+        gitignore.write_text('venv/\n__pycache__/\n*.pyc\n*.log\n*.backup.*\n.DS_Store\n')
+    run_git(['add', '.'])
+    if not commit_message:
+        commit_message = f'Update: {time.strftime("%Y-%m-%d %H:%M:%S")}'
+    code, out = run_git(['commit', '-m', commit_message])
+    if code != 0 and 'nothing to commit' in out.lower():
+        log_gen("• No changes to commit")
+        log_gen("═" * 60)
+        return True
+    token_url = app["git_repo_url"].replace('https://', f'https://{urlquote(app["git_token"], safe="")}@')
+    code, out = run_git(['remote'])
+    if 'origin' not in out:
+        run_git(['remote', 'add', 'origin', token_url])
+        log_gen("• Added remote origin")
+    else:
+        run_git(['remote', 'set-url', 'origin', token_url])
+    code, out = run_git(['push', '-u', 'origin', 'main', '--force'])
+    if code != 0:
+        log_gen(f"❌ Push failed: {out[:150]}")
+        log_gen("═" * 60)
+        return False
+    log_gen(f"✅ Successfully pushed to: {app['git_username']}/{app['git_repo_name']}")
+    log_gen(f"Branch: main")
+    log_gen("═" * 60)
+    return True
+
+def auto_fix_error():
+    if app["auto_fix_running"]:
+        return
+    app["auto_fix_running"] = True
+    app["fix_attempts"] += 1
+    if app["fix_attempts"] > app["max_fix_attempts"]:
+        log_gen("")
+        log_gen("═" * 60)
+        log_gen(f"⚠️  Max fix attempts ({app['max_fix_attempts']}) reached")
+        log_gen("Please use manual update to fix the issue")
+        log_gen("═" * 60)
+        app["auto_fix_running"] = False
+        app["phase"] = "done"
+        return
+    proj_dir = Path(app["project_dir"])
+    app_file = proj_dir / 'app.py'
+    if not app_file.exists():
+        app["auto_fix_running"] = False
+        return
+    current_code = app_file.read_text(encoding='utf-8')
+    error_context = extract_error_context(app["mac_output"])
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen(f"🔧 AUTO-FIX AGENT (Attempt {app['fix_attempts']}/{app['max_fix_attempts']})")
+    log_gen(f"Model: {app['fix_model']}")
+    log_gen("═" * 60)
+    log_gen("")
+    log_gen("📋 Error Analysis:")
+    log_gen(error_context[-200:])
+    log_gen("")
+    log_gen("💡 Generating fixed code (streaming live)...")
+    log_gen("─" * 60)
+    llm = Ollama(app["fix_model"], app["base_url"], app["timeout"])
+    prompt = f"""Fix this Python code that has an error. Provide ONLY the complete corrected code.
+
+ERROR:
+{error_context[-500:]}
+
+CURRENT CODE:
+{current_code}
+
+Analyze the error and return the COMPLETE fixed code:"""
+    try:
+        response = llm.generate(prompt, temp=0.2, silent=False)
+        fixed_code = extract_code(response)
+        if '__name__' not in fixed_code:
+            fixed_code += '\n\nif __name__ == "__main__":\n    main()\n'
+        log_gen("─" * 60)
+        log_gen("")
+        backup = proj_dir / f'app.py.backup.fix{app["fix_attempts"]}.{int(time.time())}'
+        shutil.copy(app_file, backup)
+        app_file.write_text(fixed_code, encoding='utf-8')
+        log_gen(f"✅ Fixed code saved (backup: {backup.name})")
+        imports = extract_imports(fixed_code)
+        packages = map_to_pip(imports)
+        if packages:
+            python_exec = Path(app["python_exec"])
+            log_gen("Checking dependencies...")
+            for pkg in packages:
+                subprocess.run([str(python_exec), '-m', 'pip', 'install', pkg, '--quiet'], capture_output=True, timeout=180)
+        app["mac_output"].clear()
+        log_gen("")
+        log_gen("🚀 Relaunching with fixed code...")
+        log_mac("═" * 60)
+        log_mac(f"$ python3 app.py  (auto-fix attempt {app['fix_attempts']})")
+        log_mac("═" * 60)
+        python_exec = Path(app["python_exec"])
+        process = subprocess.Popen([str(python_exec), str(app_file)], cwd=str(proj_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        has_new_error = False
+        for line in process.stdout:
+            log_mac(line.rstrip())
+            if detect_error_in_output(app["mac_output"]):
+                has_new_error = True
+        process.wait()
+        log_mac(f"\nProcess exited: {process.returncode}")
+        if process.returncode == 0 and not has_new_error:
+            log_gen("")
+            log_gen("✅ AUTO-FIX SUCCESS! No errors detected")
+            app["fix_attempts"] = 0
+            app["error_detected"] = False
+            app["phase"] = "done"
+            git_push_code(f"Auto-fix: Resolved error (attempt {app['fix_attempts']})")
+        else:
+            log_gen("")
+            log_gen(f"⚠️  Still has errors - preparing retry")
+            app["error_detected"] = True
+            if app["fix_attempts"] < app["max_fix_attempts"]:
+                log_gen(f"Scheduling attempt {app['fix_attempts'] + 1}/{app['max_fix_attempts']}...")
+                app["auto_fix_running"] = False
+                time.sleep(1)
+                threading.Timer(0.5, auto_fix_error).start()
+                return
+            else:
+                log_gen("")
+                log_gen("═" * 60)
+                log_gen("⚠️  Maximum attempts reached")
+                log_gen("Please use Manual Update to continue")
+                log_gen("═" * 60)
+                app["phase"] = "done"
+    except Exception as e:
+        log_gen("")
+        log_gen(f"❌ Auto-fix error: {str(e)[:200]}")
+        app["error_detected"] = True
+        if app["fix_attempts"] < app["max_fix_attempts"]:
+            app["auto_fix_running"] = False
+            threading.Timer(1.0, auto_fix_error).start()
+            return
+        else:
+            app["phase"] = "done"
+    app["auto_fix_running"] = False
+
+def run_pipeline(request: str):
+    app["started"] = True
+    app["phase"] = "gen"
+    app["fix_attempts"] = 0
+    app["error_detected"] = False
+    clear_terminals()
+    proj_dir = Path(app["project_dir"])
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    log_gen("═" * 60)
+    log_gen("AGI PYTHON MASTER - CODE GENERATION")
+    log_gen("═" * 60)
+    log_gen(f"Request: {request}")
+    log_gen(f"Primary Model: {app['primary_model']}")
+    log_gen(f"Fix Model: {app['fix_model']}")
+    log_gen("")
+    log_gen("🤖 Agent 1: Generating code...")
+    log_gen("")
+    llm = Ollama(app["primary_model"], app["base_url"], app["timeout"])
+    if not llm.available():
+        log_gen("❌ Ollama not available")
+        app["phase"] = "idle"
+        return
+    prompt = f"""Write complete Python code for this request. Single file, production-ready.
+
+REQUEST: {request}
+
+Include:
+- Error handling
+- if __name__ == "__main__": main()
+
+Return ONLY Python code:"""
+    try:
+        response = llm.generate(prompt)
+        code = extract_code(response)
+        if '__name__' not in code:
+            code += '\n\nif __name__ == "__main__":\n    main()\n'
+        app["generated_code"] = code
+        app_file = proj_dir / 'app.py'
+        app_file.write_text(code, encoding='utf-8')
+        log_gen("")
+        log_gen("✅ Code generated and saved to app.py")
+    except Exception as e:
+        log_gen(f"❌ Generation failed: {e}")
+        app["phase"] = "idle"
+        return
+    time.sleep(1)
+    app["phase"] = "review"
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen("🔍 Agent 2: Reviewing code...")
+    try:
+        ast.parse(code)
+        log_gen("✅ Syntax: PASS")
+    except SyntaxError as e:
+        log_gen(f"❌ Syntax error at line {e.lineno}: {e.msg}")
+        app["phase"] = "idle"
+        return
+    warnings = []
+    if 'eval(' in code:
+        warnings.append('eval()')
+    if 'exec(' in code:
+        warnings.append('exec()')
+    if warnings:
+        log_gen(f"⚠️  Warnings: {', '.join(warnings)}")
+    else:
+        log_gen("✅ No security warnings")
+    time.sleep(1)
+    app["phase"] = "venv"
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen("🐍 Agent 3: Setting up virtual environment...")
+    venv_path = proj_dir / 'venv'
+    if not venv_path.exists():
+        try:
+            venv.create(venv_path, with_pip=True)
+            log_gen("✅ Virtual environment created")
+        except Exception as e:
+            log_gen(f"❌ Venv failed: {e}")
+            app["phase"] = "idle"
+            return
+    else:
+        log_gen("✅ Virtual environment exists")
+    python_exec = venv_path / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    app["python_exec"] = str(python_exec)
+    time.sleep(1)
+    app["phase"] = "install"
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen("📦 Agent 4: Installing packages...")
+    imports = extract_imports(code)
+    packages = map_to_pip(imports)
+    if packages:
+        log_gen(f"Packages: {', '.join(packages)}")
+        for i, pkg in enumerate(packages, 1):
+            log_gen(f"Installing {pkg} ({i}/{len(packages)})...")
+            try:
+                subprocess.run([str(python_exec), '-m', 'pip', 'install', pkg, '--quiet'], capture_output=True, timeout=180)
+                log_gen(f"  ✅ {pkg}")
+            except:
+                log_gen(f"  ⚠️  {pkg} failed")
+    else:
+        log_gen("✅ No external packages needed")
+    time.sleep(1)
+    app["phase"] = "run"
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen("🚀 Agent 5: Launching application...")
+    log_gen("Error detection: ACTIVE")
+    log_gen("See Mac Terminal below →")
+    log_mac("═" * 60)
+    log_mac(f"$ python3 app.py")
+    log_mac("═" * 60)
+    try:
+        process = subprocess.Popen([str(python_exec), str(proj_dir / 'app.py')], cwd=str(proj_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in process.stdout:
+            log_mac(line.rstrip())
+            if detect_error_in_output(app["mac_output"]):
+                app["error_detected"] = True
+        process.wait()
+        log_mac(f"\nProcess exited: {process.returncode}")
+        if process.returncode == 0 and not app["error_detected"]:
+            log_gen("✅ Application completed successfully")
+            app["phase"] = "done"
+            git_push_code("Initial version - First code generation")
+        else:
+            log_gen("❌ Error detected in application output")
+            app["phase"] = "error"
+            log_gen("")
+            log_gen("Triggering auto-fix agent...")
+            threading.Thread(target=auto_fix_error, daemon=True).start()
+    except Exception as e:
+        log_mac(f"Error: {e}")
+        log_gen(f"❌ Launch failed: {e}")
+        app["phase"] = "error"
+
+def apply_manual_update(update_request: str):
+    proj_dir = Path(app["project_dir"])
+    app_file = proj_dir / 'app.py'
+    if not app_file.exists():
+        log_gen("❌ No app.py found")
+        return
+    app["phase"] = "updating"
+    current_code = app_file.read_text(encoding='utf-8')
+    log_gen("")
+    log_gen("═" * 60)
+    log_gen("🔄 MANUAL UPDATE STARTED")
+    log_gen(f"Request: {update_request}")
+    log_gen(f"Model: {app['primary_model']}")
+    log_gen("═" * 60)
+    log_gen("")
+    llm = Ollama(app["primary_model"], app["base_url"], app["timeout"])
+    prompt = f"""Update this Python code according to the user's instruction.
+
+USER REQUEST: {update_request}
+
+CURRENT CODE:
+{current_code}
+
+Provide the COMPLETE updated code with the requested changes.
+Return ONLY Python code:"""
+    try:
+        log_gen("💡 Generating updated code (streaming live)...")
+        log_gen("─" * 60)
+        response = llm.generate(prompt, temp=0.5, silent=False)
+        new_code = extract_code(response)
+        if '__name__' not in new_code:
+            new_code += '\n\nif __name__ == "__main__":\n    main()\n'
+        log_gen("─" * 60)
+        log_gen("")
+        backup = proj_dir / f'app.py.backup.manual.{int(time.time())}'
+        shutil.copy(app_file, backup)
+        app_file.write_text(new_code, encoding='utf-8')
+        log_gen(f"✅ Code updated (backup: {backup.name})")
+        imports = extract_imports(new_code)
+        packages = map_to_pip(imports)
+        if packages:
+            python_exec = Path(app["python_exec"])
+            log_gen("Checking dependencies...")
+            for pkg in packages:
+                subprocess.run([str(python_exec), '-m', 'pip', 'install', pkg, '--quiet'], capture_output=True, timeout=180)
+        app["mac_output"].clear()
+        app["error_detected"] = False
+        app["fix_attempts"] = 0
+        app["phase"] = "run"
+        log_gen("")
+        log_gen("🚀 Launching updated application...")
+        log_mac("═" * 60)
+        log_mac("$ python3 app.py  (manually updated)")
+        log_mac("═" * 60)
+        python_exec = Path(app["python_exec"])
+        process = subprocess.Popen([str(python_exec), str(app_file)], cwd=str(proj_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        has_error = False
+        for line in process.stdout:
+            log_mac(line.rstrip())
+            if detect_error_in_output(app["mac_output"]):
+                has_error = True
+                app["error_detected"] = True
+        process.wait()
+        log_mac(f"\nProcess exited: {process.returncode}")
+        if process.returncode == 0 and not has_error:
+            log_gen("")
+            log_gen("✅ Manual update successful - application running")
+            app["phase"] = "done"
+            git_push_code(f"Manual update: {update_request[:50]}")
+        else:
+            log_gen("")
+            log_gen("❌ Error detected after manual update")
+            log_gen("Activating auto-fix agent...")
+            app["phase"] = "error"
+            time.sleep(1)
+            threading.Thread(target=auto_fix_error, daemon=True).start()
+    except Exception as e:
+        log_gen("")
+        log_gen(f"❌ Manual update failed: {str(e)[:200]}")
+        app["phase"] = "done"
+
+st.title("🧠 AGI Python Master")
+
+with st.sidebar:
+    settings_clicked = st.button(f"{'▼' if app['settings_expanded'] else '▶'} Settings", use_container_width=True)
+    if settings_clicked:
+        app["settings_expanded"] = not app["settings_expanded"]
+    if app["settings_expanded"]:
+        st.markdown("---")
+        st.markdown("### Model Configuration")
+        llm_temp = Ollama("", app["base_url"], app["timeout"])
+        if llm_temp.available():
+            models = llm_temp.get_models()
+            if models:
+                app["available_models"] = models
+                primary_idx = 0
+                if app["primary_model"] in models:
+                    primary_idx = models.index(app["primary_model"])
+                app["primary_model"] = st.selectbox("Primary Model (Code Generation)", options=models, index=primary_idx, help="Used for initial code generation and manual updates")
+                fix_idx = 0
+                if app["fix_model"] in models:
+                    fix_idx = models.index(app["fix_model"])
+                elif len(models) > 1:
+                    fix_idx = 1
+                app["fix_model"] = st.selectbox("Fix Model (Auto Error Correction)", options=models, index=fix_idx, help="Automatically fixes errors detected in Mac terminal")
+        else:
+            st.warning("Ollama not available")
+            app["primary_model"] = st.text_input("Primary Model", "qwen2.5-coder:7b")
+            app["fix_model"] = st.text_input("Fix Model", "codellama")
+        app["base_url"] = st.text_input("Ollama URL", app["base_url"])
+        app["timeout"] = st.number_input("Timeout (s)", 30, 600, app["timeout"])
+        app["max_tokens"] = st.number_input("Max Tokens", 500, 8000, app["max_tokens"])
+        app["max_fix_attempts"] = st.number_input("Max Auto-Fix Attempts", 1, 5, app["max_fix_attempts"])
+        st.markdown("---")
+        st.markdown("### GitHub Integration")
+        if app["git_connected"]:
+            if app["git_repo_created"]:
+                st.markdown(f'<div class="git-status git-connected">✅ Connected & Ready<br>User: {app["git_username"]}<br>Repo: {app["git_repo_name"]}<br>🔄 Auto-push: ON</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="git-status git-connected">✅ Connected as: {app["git_username"]}<br>⚠️ Create repository below</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="git-status git-disconnected">❌ Not connected</div>', unsafe_allow_html=True)
+        st.markdown("**Step 1: Connect GitHub**")
+        app["git_token"] = st.text_input("GitHub Personal Access Token", app["git_token"], type="password", help="Generate at: github.com/settings/tokens (needs 'repo' scope)")
+        if st.button("🔗 Connect to GitHub", use_container_width=True, type="primary", disabled=not app["git_token"]):
+            if connect_git():
+                st.success(f"Connected as {app['git_username']}")
+                st.rerun()
+            else:
+                st.error("Connection failed - check token and logs")
+        if app["git_connected"] and not app["git_repo_created"]:
+            st.markdown("---")
+            st.markdown("**Step 2: Create Repository**")
+            app["git_repo_name"] = st.text_input("Repository Name", app["git_repo_name"], placeholder="my-awesome-project", help="Choose a name for your new GitHub repository")
+            if st.button("📦 Create Repository", use_container_width=True, type="primary", disabled=not app["git_repo_name"]):
+                if create_github_repo():
+                    st.success(f"Repository '{app['git_repo_name']}' is ready!")
+                    st.rerun()
+                else:
+                    st.error("Creation failed - check logs")
+        if app["git_repo_created"]:
+            st.markdown("---")
+            st.info("✅ Auto-push enabled: Every code change is automatically pushed to GitHub main branch")
+
+col1, col2 = st.columns([0.15, 0.85])
+with col1:
+    run_disabled = not app["primary_model"] or not app["fix_model"]
+    run_clicked = st.button("▶ Run", type="primary", use_container_width=True, disabled=run_disabled)
+with col2:
+    request_text = st.text_area("Describe your project or app", height=80, placeholder="Example: Create a CLI tool that scans open ports on localhost", label_visibility="collapsed")
+
+col_logs1, col_logs2 = st.columns([0.85, 0.15])
+with col_logs1:
+    pass
+with col_logs2:
+    logs_clicked = st.button("📋 LOGS", use_container_width=True, type="secondary")
+    if logs_clicked:
+        app["show_logs"] = not app["show_logs"]
+
+if app["show_logs"]:
+    st.markdown("---")
+    st.markdown("### 📋 System Logs - Real-Time Monitoring")
+    col_log1, col_log2, col_log3 = st.columns([0.6, 0.2, 0.2])
+    with col_log1:
+        st.caption(f"**Total Logs:** {len(app['logs'])} | **Live Monitoring Active** 🟢")
+    with col_log2:
+        if st.button("🗑️ Clear Logs", use_container_width=True):
+            app["logs"].clear()
+            log_system("INFO", "UI", "Logs cleared by user")
+            st.rerun()
+    with col_log3:
+        app["log_level"] = st.selectbox("Filter", ["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "LATENCY", "FREEZE"], index=0, label_visibility="collapsed")
+    
+    st.markdown('<div class="terminal-header terminal-gen">🔍 Live System Logs</div>', unsafe_allow_html=True)
+    
+    filtered_logs = app["logs"] if app["log_level"] == "ALL" else [log for log in app["logs"] if log["level"] == app["log_level"]]
+    log_display = "\n".join([format_log_entry(entry) for entry in filtered_logs[-100:]])
+    if not log_display:
+        log_display = "No logs yet... Start generating code to see live monitoring."
+    
+    st.markdown(f'<div class="terminal-body">{log_display}</div>', unsafe_allow_html=True)
+    st.markdown("---")
+
+if run_clicked and request_text.strip():
+    threading.Thread(target=run_pipeline, args=(request_text.strip(),), daemon=True).start()
+
+if app["started"]:
+    phases = [("gen", "Generate"), ("review", "Review"), ("venv", "Venv"), ("install", "Install"), ("run", "Run"), ("done", "Done"), ("error", "Error")]
+    phase_html = '<div class="phase-bar">'
+    for phase_id, phase_name in phases:
+        if phase_id == app["phase"]:
+            if phase_id == "error" and app["auto_fix_running"]:
+                css_class = "phase-pill phase-fixing"
+                phase_name = "Auto-Fixing"
+            else:
+                css_class = "phase-pill phase-active"
+        elif phase_id == "done" and app["phase"] == "done":
+            css_class = "phase-pill phase-done"
+        elif phase_id == "error":
+            css_class = "phase-pill phase-pending"
+        else:
+            phase_idx = [p[0] for p in phases].index(phase_id)
+            current_idx = [p[0] for p in phases].index(app["phase"]) if app["phase"] in [p[0] for p in phases] else 0
+            css_class = "phase-pill phase-done" if phase_idx < current_idx else "phase-pill phase-pending"
+        phase_html += f'<div class="{css_class}">{phase_name}</div>'
+    phase_html += '</div>'
+    st.markdown(phase_html, unsafe_allow_html=True)
+    header_badge = ""
+    if app["auto_fix_running"]:
+        header_badge = '<span class="fix-badge">AUTO-FIXING</span>'
+    col_gen1, col_gen2 = st.columns([0.85, 0.15])
+    with col_gen1:
+        st.markdown(f'<div class="terminal-header terminal-gen">📝 Code Generation Terminal {header_badge}</div>', unsafe_allow_html=True)
+    with col_gen2:
+        if st.button("✏️ Edit", key="edit_code_btn", use_container_width=True):
+            app["show_editor"] = not app["show_editor"]
+            proj_dir = Path(app["project_dir"])
+            app_file = proj_dir / 'app.py'
+            if app_file.exists():
+                app["editor_content"] = app_file.read_text(encoding='utf-8')
+    gen_output = "\n".join(app["gen_output"]) if app["gen_output"] else "Waiting..."
+    st.markdown(f'<div class="terminal-body" id="gen-terminal">{gen_output}</div>', unsafe_allow_html=True)
+    
+    # JavaScript to auto-scroll the terminal
+    st.markdown("""
+    <script>
+    setTimeout(function() {
+        const containers = window.parent.document.querySelectorAll('.terminal-body');
+        containers.forEach(function(container) {
+            if (container.id === 'gen-terminal') {
+                container.scrollTop = container.scrollHeight;
+            }
+        });
+    }, 100);
+    </script>
+    """, unsafe_allow_html=True)
+    if app["show_editor"]:
+        st.markdown("---")
+        st.markdown("### ✏️ Code Editor")
+        edited_code = st.text_area("Edit your code:", value=app["editor_content"], height=400, key="code_editor")
+        col_save1, col_save2 = st.columns([0.5, 0.5])
+        with col_save1:
+            if st.button("💾 Save & Run", type="primary", use_container_width=True):
+                proj_dir = Path(app["project_dir"])
+                app_file = proj_dir / 'app.py'
+                backup = proj_dir / f'app.py.backup.manual.{int(time.time())}'
+                if app_file.exists():
+                    shutil.copy(app_file, backup)
+                app_file.write_text(edited_code, encoding='utf-8')
+                log_gen("")
+                log_gen("═" * 60)
+                log_gen("✏️ MANUAL EDIT SAVED")
+                log_gen(f"Backup: {backup.name}")
+                log_gen("═" * 60)
+                app["mac_output"].clear()
+                app["error_detected"] = False
+                app["fix_attempts"] = 0
+                app["show_editor"] = False
+                log_mac("═" * 60)
+                log_mac("$ python3 app.py  (manually edited)")
+                log_mac("═" * 60)
+                python_exec = Path(app["python_exec"])
+                process = subprocess.Popen([str(python_exec), str(app_file)], cwd=str(proj_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                for line in process.stdout:
+                    log_mac(line.rstrip())
+                    if detect_error_in_output(app["mac_output"]):
+                        app["error_detected"] = True
+                process.wait()
+                log_mac(f"\nProcess exited: {process.returncode}")
+                if process.returncode == 0 and not app["error_detected"]:
+                    log_gen("✅ Manual edit successful")
+                    app["phase"] = "done"
+                    git_push_code("Manual code edit via editor")
+                else:
+                    log_gen("❌ Error detected - triggering auto-fix")
+                    app["phase"] = "error"
+                    threading.Thread(target=auto_fix_error, daemon=True).start()
+                st.rerun()
+        with col_save2:
+            if st.button("❌ Cancel", use_container_width=True):
+                app["show_editor"] = False
+                st.rerun()
+    if app["phase"] in ["run", "done", "error"]:
+        mac_header_badge = ""
+        if app["error_detected"] and not app["auto_fix_running"]:
+            mac_header_badge = '<span class="error-badge">ERROR DETECTED</span>'
+        elif app["auto_fix_running"]:
+            mac_header_badge = '<span class="fix-badge">FIXING...</span>'
+        st.markdown(f'<div class="terminal-header terminal-mac">💻 Mac Terminal {mac_header_badge}</div>', unsafe_allow_html=True)
+        mac_output = "\n".join(app["mac_output"]) if app["mac_output"] else "Application output..."
+        st.markdown(f'<div class="terminal-body">{mac_output}</div>', unsafe_allow_html=True)
+    if app["phase"] == "done" and not app["auto_fix_running"]:
+        st.markdown("---")
+        st.markdown("### 🔄 Manual Update")
+        st.caption("Use this to add features when your app is working correctly")
+        col1, col2 = st.columns([0.75, 0.25])
+        with col1:
+            update_text = st.text_input("Add/modify features:", placeholder="Example: Add a --verbose flag for detailed output", key="manual_update_input")
+        with col2:
+            update_clicked = st.button("Update & Run", use_container_width=True, type="primary")
+        if update_clicked:
+            if update_text.strip():
+                threading.Thread(target=apply_manual_update, args=(update_text.strip(),), daemon=True).start()
+                st.rerun()
+            else:
+                st.warning("Please enter an update description")
+    if app["phase"] == "done" and not app["error_detected"]:
+        if app["git_repo_created"]:
+            st.success(f"✅ Application running successfully | Auto-pushed to: {app['git_username']}/{app['git_repo_name']}")
+        else:
+            st.info("✅ Application running successfully. Error auto-detection is active.")
+    elif app["error_detected"] and app["auto_fix_running"]:
+        st.warning(f"🔧 Auto-fix agent working (attempt {app['fix_attempts']}/{app['max_fix_attempts']})... Changes will auto-push on success")
+    elif app["error_detected"] and app["fix_attempts"] >= app["max_fix_attempts"]:
+        st.error("⚠️ Max auto-fix attempts reached. Please use manual update to resolve the issue.")
+    if app["phase"] in ["gen", "review", "venv", "install", "run", "updating"] or app["auto_fix_running"]:
+        time.sleep(0.5)
+        st.rerun()
